@@ -1,0 +1,17 @@
+// Add these dependencies to your app/build.gradle file:
+
+dependencies {
+    // Existing dependencies...
+    
+    // For HTTP requests to RapidAPI
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    
+    // For JSON parsing
+    implementation 'org.json:json:20230227'
+    
+    // For coroutines (if not already added)
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    
+    // For lifecycle scope (if not already added)
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
+}

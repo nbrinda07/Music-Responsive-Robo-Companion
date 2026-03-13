@@ -1,0 +1,468 @@
+package com.example.robotspotifyapp
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.robotspotifyapp.ui.theme.RobotSpotifyAppTheme
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+// --- GLOBAL DEBUGGER ---
+object GlobalDebug {
+    var lastError: String = "No error yet"
+}
+
+// --- DATA CLASSES ---
+data class Track(val id: String, val name: String, val artistName: String, val albumName: String)
+data class AudioFeatures(
+    val valence: Float,
+    val energy: Float,
+    val speechiness: Float,
+    val danceability: Float,
+    val tempo: Float,
+    val acousticness: Float
+)
+data class CurrentlyPlaying(val track: Track, val isPlaying: Boolean)
+enum class RobotEmotion { HAPPY_ENERGETIC, HAPPY_CHILL, COOL_RAP, AGGRESSIVE_RAP, SAD, ROMANTIC_SLOW, ROMANTIC_HAPPY, NEUTRAL }
+
+// --- RAPID API SERVICE ---
+class RapidAPIService {
+    // SECURITY NOTE: If you are getting Error 429, you need a new Key!
+    private val apiKey = "b80befb914msh7280997d42383a5p1c05bajsne857375704bf"
+    private val baseUrl = "https://track-analysis.p.rapidapi.com"
+
+    suspend fun getAudioFeatures(songName: String, artistName: String): AudioFeatures? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val client = OkHttpClient()
+                val encodedSong = URLEncoder.encode(songName, "UTF-8")
+                val encodedArtist = URLEncoder.encode(artistName, "UTF-8")
+
+                // FIX: Correct URL path /pktx/analysis
+                val url = "$baseUrl/pktx/analysis?song=$encodedSong&artist=$encodedArtist"
+
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader("x-rapidapi-key", apiKey)
+                    .addHeader("x-rapidapi-host", "track-analysis.p.rapidapi.com")
+                    .get()
+                    .build()
+
+                val response = client.newCall(request).execute()
+
+                if (response.isSuccessful) {
+                    val responseBody = response.body?.string()
+                    responseBody?.let { parseAudioFeatures(it) }
+                } else {
+                    GlobalDebug.lastError = "API Error: ${response.code} ${response.message}"
+                    null
+                }
+            } catch (e: Exception) {
+                GlobalDebug.lastError = "Network Error: ${e.message}"
+                e.printStackTrace()
+                null
+            }
+        }
+    }
+
+    private fun parseAudioFeatures(json: String): AudioFeatures? {
+        return try {
+            val jsonObject = JSONObject(json)
+            AudioFeatures(
+                valence = jsonObject.optDouble("happiness", 50.0).toFloat(),
+                energy = jsonObject.optDouble("energy", 50.0).toFloat(),
+                speechiness = jsonObject.optDouble("speechiness", 10.0).toFloat(),
+                danceability = jsonObject.optDouble("danceability", 50.0).toFloat(),
+                tempo = jsonObject.optDouble("tempo", 120.0).toFloat(),
+                acousticness = jsonObject.optDouble("acousticness", 50.0).toFloat()
+            )
+        } catch (e: Exception) {
+            GlobalDebug.lastError = "JSON Parse Error: ${e.message}"
+            null
+        }
+    }
+}
+
+// --- SMART ANALYZER ---
+class SmartMusicAnalyzer(private val context: ComponentActivity) {
+    private val rapidAPI = RapidAPIService()
+    private val expressionEngine = RobotExpressionEngine()
+    private var lastAudioFeatures: AudioFeatures? = null
+
+    // ... (Your preloadedEmotions map stays the same) ...
+    private val preloadedEmotions = mapOf(
+        "sicko mode travis scott" to RobotEmotion.AGGRESSIVE_RAP,
+        "blinding lights the weeknd" to RobotEmotion.HAPPY_ENERGETIC,
+        "someone like you adele" to RobotEmotion.SAD,
+        "humble. kendrick lamar" to RobotEmotion.COOL_RAP,
+        "perfect ed sheeran" to RobotEmotion.ROMANTIC_SLOW,
+        "bad guy billie eilish" to RobotEmotion.COOL_RAP,
+        "shape of you ed sheeran" to RobotEmotion.HAPPY_ENERGETIC,
+        "god's plan drake" to RobotEmotion.COOL_RAP,
+        "anti-hero taylor swift" to RobotEmotion.HAPPY_CHILL,
+        "as it was harry styles" to RobotEmotion.HAPPY_CHILL
+    )
+
+    suspend fun getEmotionForSong(songName: String, artistName: String): RobotEmotion {
+        val songKey = "${songName.lowercase()} ${artistName.lowercase()}"
+
+        // 1. Check Preloaded (Features are NULL here by default)
+        preloadedEmotions[songKey]?.let {
+            lastAudioFeatures = null
+            return it
+        }
+
+        // 2. Check Cache
+        val cachedEmotion = getCachedEmotion(songKey)
+        if (cachedEmotion != null) {
+            // ✅ FIX: Retrieve the features from cache too!
+            // If we don't do this, lastAudioFeatures stays "stale" from the previous song.
+            lastAudioFeatures = getCachedFeatures(songKey)
+            return cachedEmotion
+        }
+
+        // 3. Call API
+        if (canMakeAPICall()) {
+            val features = rapidAPI.getAudioFeatures(songName, artistName)
+            if (features != null) {
+                lastAudioFeatures = features
+                val emotion = expressionEngine.analyzeEmotion(features)
+                // ✅ FIX: Cache BOTH emotion and features
+                cacheData(songKey, emotion, features)
+                incrementAPICallCount()
+                return emotion
+            } else {
+                lastAudioFeatures = null
+                return RobotEmotion.NEUTRAL
+            }
+        }
+        GlobalDebug.lastError = "Daily Limit Reached (0/3)"
+        return RobotEmotion.NEUTRAL
+    }
+
+    // --- HELPER FUNCTIONS ---
+
+    private fun getCachedEmotion(songKey: String): RobotEmotion? {
+        val prefs = context.getSharedPreferences("song_cache", ComponentActivity.MODE_PRIVATE)
+        val emotionName = prefs.getString("emotion_$songKey", null)
+        return emotionName?.let { try { RobotEmotion.valueOf(it) } catch (e: Exception) { null } }
+    }
+
+    // ✅ NEW: Helper to get features from cache
+    private fun getCachedFeatures(songKey: String): AudioFeatures? {
+        val prefs = context.getSharedPreferences("song_cache", ComponentActivity.MODE_PRIVATE)
+        val featuresString = prefs.getString("features_$songKey", null) ?: return null
+
+        return try {
+            val parts = featuresString.split(",")
+            AudioFeatures(
+                valence = parts[0].toFloat(),
+                energy = parts[1].toFloat(),
+                speechiness = parts[2].toFloat(),
+                danceability = parts[3].toFloat(),
+                tempo = parts[4].toFloat(),
+                acousticness = parts[5].toFloat()
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // ✅ NEW: Helper to save BOTH emotion and features
+    private fun cacheData(songKey: String, emotion: RobotEmotion, features: AudioFeatures) {
+        val prefs = context.getSharedPreferences("song_cache", ComponentActivity.MODE_PRIVATE)
+        val editor = prefs.edit()
+
+        // Save Emotion
+        editor.putString("emotion_$songKey", emotion.name)
+
+        // Save Features as a simple comma-separated string
+        val featuresString = "${features.valence},${features.energy},${features.speechiness},${features.danceability},${features.tempo},${features.acousticness}"
+        editor.putString("features_$songKey", featuresString)
+
+        editor.apply()
+    }
+
+    // ... (Keep your existing canMakeAPICall, incrementAPICallCount, getAPICallsRemaining, etc.) ...
+    private fun canMakeAPICall(): Boolean {
+        val prefs = context.getSharedPreferences("api_usage", ComponentActivity.MODE_PRIVATE)
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val lastDate = prefs.getString("last_date", "")
+        return if (lastDate == today) prefs.getInt("calls_today", 0) < 3 else true
+    }
+
+    private fun incrementAPICallCount() {
+        val prefs = context.getSharedPreferences("api_usage", ComponentActivity.MODE_PRIVATE)
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val callsToday = if (prefs.getString("last_date", "") == today) prefs.getInt("calls_today", 0) else 0
+        prefs.edit().putString("last_date", today).putInt("calls_today", callsToday + 1).apply()
+    }
+
+    fun getAPICallsRemaining(): Int {
+        val prefs = context.getSharedPreferences("api_usage", ComponentActivity.MODE_PRIVATE)
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val callsToday = if (prefs.getString("last_date", "") == today) prefs.getInt("calls_today", 0) else 0
+        return (3 - callsToday).coerceAtLeast(0)
+    }
+
+    fun clearAllCache() {
+        context.getSharedPreferences("song_cache", ComponentActivity.MODE_PRIVATE).edit().clear().apply()
+        context.getSharedPreferences("api_usage", ComponentActivity.MODE_PRIVATE).edit().clear().apply()
+        context.getSharedPreferences("robot_info", ComponentActivity.MODE_PRIVATE).edit().clear().apply()
+        GlobalDebug.lastError = "Cache Reset. Try again."
+    }
+
+    fun getLastAudioFeatures(): AudioFeatures? = lastAudioFeatures
+}
+
+// --- MOCK SPOTIFY ---
+class MockSpotifyService {
+    private val mockTracks = listOf(
+        Track("4", "Gnarly", "Katseye", "Beautiful Chaos"),
+        Track("3", "Luka Chippi", "Seedhe Maut", "Lunch Break"),
+        Track("2", "Kala Chashma", "Badshah", "-"),
+        Track("1", "Maar Kaat", "Seedhe Maut", "dl91fm"),
+        Track("5", "Baby", "Justin Bieber", "My World 2.0"),
+        Track("6", "Blinding Lights", "The Weeknd", "After Hours"),
+        Track("7", "Someone Like You", "Adele", "21"),
+        Track("8", "HUMBLE.", "Kendrick Lamar", "DAMN."),
+        Track("9", "Perfect", "Ed Sheeran", "÷"),
+        Track("10", "Bad Guy", "Billie Eilish", "When We All Fall Asleep")
+    )
+    private var currentTrackIndex = 0
+    fun getCurrentlyPlaying(): CurrentlyPlaying = CurrentlyPlaying(mockTracks[currentTrackIndex], true)
+    fun nextTrack() { currentTrackIndex = (currentTrackIndex + 1) % mockTracks.size }
+}
+
+class RobotExpressionEngine {
+    fun analyzeEmotion(features: AudioFeatures): RobotEmotion {
+        return when {
+            //rap
+            features.speechiness > 25f -> {
+                if (features.energy > 60f) {
+                    RobotEmotion.AGGRESSIVE_RAP
+                }
+                else {
+                    RobotEmotion.COOL_RAP
+                }
+            }
+
+            //sad done
+            features.speechiness < 12f && features.valence < 40f -> {
+                RobotEmotion.SAD
+            }
+
+            //aggressive happy done
+            features.valence >= 40f && (features.energy > 60f || features.danceability > 50f) -> {
+                    RobotEmotion.HAPPY_ENERGETIC
+                }
+
+            //slow romance
+            features.energy < 60f && features.acousticness > 45f && features.valence > 35f -> {
+                    RobotEmotion.ROMANTIC_SLOW
+                }
+
+            //sexy romance
+            features.energy < 60f && features.danceability > 60f && features.valence < 70f -> {
+                    RobotEmotion.ROMANTIC_HAPPY
+                }
+
+            //calm happy
+            features.valence > 40f && features.energy < 60f -> {
+                RobotEmotion.HAPPY_CHILL
+            }
+
+            else -> RobotEmotion.NEUTRAL
+        }
+    }
+    fun getEmotionDescription(emotion: RobotEmotion): String = when(emotion) {
+        RobotEmotion.HAPPY_ENERGETIC -> "😄 Dancing & Excited!"
+        RobotEmotion.HAPPY_CHILL -> "😊 Happy & Relaxed"
+        RobotEmotion.COOL_RAP -> "😎 Cool & Chill Vibes"
+        RobotEmotion.AGGRESSIVE_RAP -> "😤 Intense & Fired Up!"
+        RobotEmotion.SAD -> "😢 Sad & Slow"
+        RobotEmotion.ROMANTIC_SLOW -> "💕 Hearts & Calm"
+        RobotEmotion.ROMANTIC_HAPPY -> "💖 Hearts & Smiling!"
+        RobotEmotion.NEUTRAL -> "😐 Neutral"
+    }
+}
+
+// --- MAIN ACTIVITY ---
+class MainActivity : ComponentActivity() {
+    private val mockSpotify = MockSpotifyService()
+    private lateinit var smartAnalyzer: SmartMusicAnalyzer
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        smartAnalyzer = SmartMusicAnalyzer(this)
+        val prefs = getSharedPreferences("robot_info", MODE_PRIVATE)
+
+        setContent {
+            RobotSpotifyAppTheme {
+                var isLoggedIn by remember { mutableStateOf(prefs.getBoolean("isLoggedIn", false)) }
+                var currentSong by remember { mutableStateOf("No song playing") }
+                var currentArtist by remember { mutableStateOf("") }
+                var currentEmotion by remember { mutableStateOf(RobotEmotion.NEUTRAL) }
+                var audioFeatures by remember { mutableStateOf<AudioFeatures?>(null) }
+                var isLoading by remember { mutableStateOf(false) }
+                var apiCallsRemaining by remember { mutableStateOf(smartAnalyzer.getAPICallsRemaining()) }
+                var debugMsg by remember { mutableStateOf("") }
+
+                if (isLoggedIn) {
+                    Page2Screen(
+                        songName = currentSong,
+                        artistName = currentArtist,
+                        emotion = currentEmotion,
+                        audioFeatures = audioFeatures,
+                        emotionDescription = RobotExpressionEngine().getEmotionDescription(currentEmotion),
+                        isLoading = isLoading,
+                        apiCallsRemaining = apiCallsRemaining,
+                        debugError = debugMsg,
+                        onRefresh = {
+                            isLoading = true
+                            lifecycleScope.launch {
+                                try {
+                                    mockSpotify.nextTrack()
+                                    val playing = mockSpotify.getCurrentlyPlaying()
+                                    currentSong = playing.track.name
+                                    currentArtist = playing.track.artistName
+
+                                    val emotion = smartAnalyzer.getEmotionForSong(currentSong, currentArtist)
+                                    val features = smartAnalyzer.getLastAudioFeatures()
+
+                                    currentEmotion = emotion
+                                    audioFeatures = features
+                                    apiCallsRemaining = smartAnalyzer.getAPICallsRemaining()
+                                    debugMsg = GlobalDebug.lastError // Update UI with error
+                                } catch (e: Exception) {
+                                    debugMsg = "Crash: ${e.message}"
+                                } finally {
+                                    isLoading = false
+                                }
+                            }
+                        },
+                        onLogout = {
+                            isLoggedIn = false
+                            prefs.edit().putBoolean("isLoggedIn", false).apply()
+                        },
+                        onReset = {
+                            smartAnalyzer.clearAllCache()
+                            apiCallsRemaining = 3
+                            currentSong = "No song playing"
+                            currentArtist = ""
+                            currentEmotion = RobotEmotion.NEUTRAL
+                            audioFeatures = null
+                            debugMsg = "Cache Cleared."
+                            isLoggedIn = false
+                        }
+                    )
+                } else {
+                    LoginScreen {
+                        isLoggedIn = true
+                        prefs.edit().putBoolean("isLoggedIn", true).apply()
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun LoginScreen(onLoginSuccess: () -> Unit) {
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF4A3B2F)), contentAlignment = Alignment.Center) {
+        Button(onClick = onLoginSuccess, modifier = Modifier.width(260.dp).height(70.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFCEBEB1)), shape = RoundedCornerShape(28.dp)) {
+            Text("Login", color = Color(0xFF3B2F25), fontSize = 23.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun Page2Screen(
+    songName: String, artistName: String, emotion: RobotEmotion, audioFeatures: AudioFeatures?,
+    emotionDescription: String, isLoading: Boolean, apiCallsRemaining: Int, debugError: String,
+    onRefresh: () -> Unit, onLogout: () -> Unit, onReset: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFFCEBEB1)).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Text(if (songName == "No song playing") songName else "♪ $songName", color = Color(0xFF4A3B2F), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        if (artistName.isNotEmpty()) { Spacer(modifier = Modifier.height(8.dp)); Text("by $artistName", color = Color(0xFF4A3B2F), fontSize = 18.sp, fontWeight = FontWeight.Medium) }
+
+        Spacer(modifier = Modifier.height(24.dp))
+        Text(if (isLoading) "🤖 Analyzing..." else "🤖 $emotionDescription", color = Color(0xFF4A3B2F), fontSize = 20.sp, fontWeight = FontWeight.Bold)
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // --- ERROR DISPLAY ---
+        if (debugError.isNotEmpty() && debugError != "No error yet") {
+            Text("DEBUG INFO:", color = Color.Red, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text(debugError, color = Color.Red, fontSize = 12.sp)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // --- DETAILED AUDIO FEATURES ---
+        audioFeatures?.let { features ->
+            Text("🎵 AUDIO FEATURES:", color = Color(0xFF4A3B2F), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Happiness: ${features.valence.toInt()}/100 | Energy: ${features.energy.toInt()}/100",
+                color = Color(0xFF4A3B2F), fontSize = 12.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Speech: ${features.speechiness.toInt()}/100 | Dance: ${features.danceability.toInt()}/100",
+                color = Color(0xFF4A3B2F), fontSize = 12.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Tempo: ${features.tempo.toInt()} BPM | Acoustic: ${features.acousticness.toInt()}/100",
+                color = Color(0xFF4A3B2F), fontSize = 12.sp
+            )
+        } ?: run {
+            // Only show this message if we are NOT loading and actually failed to get features
+            if (songName != "No song playing" && !isLoading) {
+                Text("ℹ️ No features (Preloaded or Failed)", color = Color(0xFF4A3B2F), fontSize = 12.sp)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+        Text("API calls remaining: $apiCallsRemaining/3", color = if (apiCallsRemaining > 0) Color(0xFF4A3B2F) else Color.Red, fontSize = 14.sp)
+
+        Spacer(modifier = Modifier.height(32.dp))
+        Button(onClick = onRefresh, enabled = !isLoading, modifier = Modifier.height(70.dp).width(240.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4A3B2F))) {
+            Text(if (isLoading) "Loading..." else "Next Song", color = Color(0xFFCEBEB1), fontSize = 23.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(onClick = onLogout, modifier = Modifier.height(70.dp).width(240.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4A3B2F))) {
+            Text("Logout", color = Color(0xFFCEBEB1), fontSize = 23.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(onClick = onReset, modifier = Modifier.height(70.dp).width(240.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB85450))) {
+            Text("Reset Cache", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
